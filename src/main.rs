@@ -68,13 +68,14 @@ struct AddArgs {
     #[arg(value_enum)]
     layer: Layer,
 
-    /// Slice name (e.g. auth, user, profile)
-    slice: String,
+    /// Slice names (e.g. auth, user, profile) - supports multiple slices
+    #[arg(required = true)]
+    slices: Vec<String>,
 
     /// Create common segments inside the slice (comma-separated)
     ///
     /// Defaults to: api,model,ui,lib,config
-    #[arg(long)]
+    #[arg(short, long)]
     segments: Option<OsString>,
 
     /// Don't create anything; only print planned paths
@@ -88,12 +89,19 @@ struct AddArgs {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Layer {
+    #[value(alias = "a")]
     App,
+    #[value(alias = "pr")]
     Processes,
+    #[value(alias = "p")]
     Pages,
+    #[value(alias = "w")]
     Widgets,
+    #[value(alias = "f")]
     Features,
+    #[value(alias = "e")]
     Entities,
+    #[value(alias = "s")]
     Shared,
 }
 
@@ -180,27 +188,58 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     let base = root.join(&args.base);
     let layer_dir = base.join(args.layer.as_dir());
 
-    let slice = sanitize_name(&args.slice)
-        .with_context(|| format!("invalid slice name: {:?}", args.slice))?;
+    let segments = parse_segments(args.segments.as_ref());
 
-    let slice_dir = layer_dir.join(&slice);
+    // Process each slice
+    for slice_name in &args.slices {
+        let slice = sanitize_name(slice_name)
+            .with_context(|| format!("invalid slice name: {:?}", slice_name))?;
 
-    let segments = parse_segments(args.segments.as_ref(), args.layer);
-    let mut dirs = vec![base, layer_dir, slice_dir.clone()];
-    for seg in segments {
-        // Avoid accidental duplicates like "shared/ui/ui" if user chooses same name.
-        if seg == slice.as_str() {
-            continue;
+        let slice_dir = layer_dir.join(&slice);
+
+        let mut dirs = vec![base.clone(), layer_dir.clone(), slice_dir.clone()];
+        for seg in &segments {
+            // Avoid accidental duplicates like "shared/ui/ui" if user chooses same name.
+            if *seg == slice.as_str() {
+                continue;
+            }
+            dirs.push(slice_dir.join(seg));
         }
-        dirs.push(slice_dir.join(seg));
+
+        create_dirs(&dirs, args.dry_run, args.force).with_context(|| {
+            format!(
+                "failed to add slice '{}' to layer '{}'",
+                slice, args.layer
+            )
+        })?;
+
+        // Create index.ts file in the slice directory
+        let index_file = slice_dir.join("index.ts");
+        create_file(&index_file, "export {};\n", args.dry_run)?;
+
+        // Create files in ui segment if it exists
+        for seg in &segments {
+            if *seg == "ui" && *seg != slice.as_str() {
+                let ui_dir = slice_dir.join("ui");
+                let ui_index = ui_dir.join("index.ts");
+                let ui_page = ui_dir.join("page.tsx");
+                
+                create_file(&ui_index, "export {};\n", args.dry_run)?;
+                create_file(&ui_page, "export default function Page() {\n  return <div>Page</div>;\n}\n", args.dry_run)?;
+            }
+        }
     }
 
-    create_dirs(&dirs, args.dry_run, args.force).with_context(|| {
-        format!(
-            "failed to add slice '{}' to layer '{}'",
-            slice, args.layer
-        )
-    })?;
+    Ok(())
+}
+
+fn create_file(path: &Path, content: &str, dry_run: bool) -> Result<()> {
+    if dry_run {
+        println!("{}", path.display());
+    } else {
+        fs::write(path, content)
+            .with_context(|| format!("failed to create file {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -252,19 +291,10 @@ fn sanitize_name(input: &str) -> Result<String> {
     Ok(s.to_string())
 }
 
-fn parse_segments(raw: Option<&OsString>, layer: Layer) -> Vec<&'static str> {
-    // Defaults:
-    // - shared layer typically uses top-level slices (ui/lib/api/...), so default is no inner segments
-    // - other slices commonly have "ui/model/api/lib/config"
-    let default_slice = ["api", "model", "ui", "lib", "config"];
-
-    let default = match layer {
-        Layer::Shared => [].as_slice(),
-        _ => default_slice.as_slice(),
-    };
-
+fn parse_segments(raw: Option<&OsString>) -> Vec<&'static str> {
+    // Default: no segments (just create the slice folder itself)
     let Some(raw) = raw else {
-        return default.to_vec();
+        return Vec::new();
     };
 
     let s = raw.to_string_lossy();
@@ -273,7 +303,7 @@ fn parse_segments(raw: Option<&OsString>, layer: Layer) -> Vec<&'static str> {
         return Vec::new();
     }
     if s.eq_ignore_ascii_case("default") {
-        return default.to_vec();
+        return vec!["api", "model", "ui", "lib", "config"];
     }
 
     // Parse comma-separated list; keep only known segments to avoid unexpected filesystem writes.
@@ -294,9 +324,5 @@ fn parse_segments(raw: Option<&OsString>, layer: Layer) -> Vec<&'static str> {
             }
         }
     }
-    if out.is_empty() {
-        default.to_vec()
-    } else {
-        out
-    }
+    out
 }
